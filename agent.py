@@ -50,7 +50,7 @@ class BaseAgent(object):
 
     @staticmethod
     def get_agent(name):
-        return globals()[name+"Agent"]
+        return globals()[name+"Agent"]  # 以字典类型返回当前位置的全部全局变量
 
     def test(self, iters=None, **kwargs):
         self.env.reset_epoch(shuffle=(iters is not None))   # If iters is not none, shuffle the env batch
@@ -234,7 +234,7 @@ class Seq2SeqAgent(BaseAgent):
                 if traj is not None:
                     traj[i]['path'].append((state.location.viewpointId, state.heading, state.elevation))
 
-    def rollout(self, train_ml=None, train_dis_l=None, train_dis_c=None, att_drop_rate=0.5, train_rl=True, reset=True):
+    def rollout(self, train_ml=None, train_dis_l=None, train_dis_c=None, att_drop_rate=0.5, train_rl=True, reset=True): # 在环境中进行一次探索，然后决定action
         """
         :param train_ml:    The weight to train with maximum likelihood
         :param train_rl:    whether use RL in training
@@ -242,36 +242,36 @@ class Seq2SeqAgent(BaseAgent):
 
         :return:
         """
-        if self.feedback == 'teacher' or self.feedback == 'argmax':
+        if self.feedback == 'teacher' or self.feedback == 'argmax': # 探索的几种模式，在rollout()的后半部分会提到
             train_rl = False
 
-        if reset:  # Reset env
+        if reset:  # Reset env 新建重启一个环境
             obs = np.array(self.env.reset())
         else:
             obs = np.array(self.env._get_obs())
 
-        batch_size = len(obs)
-        dis_loss_l = 0.
+        batch_size = len(obs)  # ob=["instruction":{},"viewpointId":{}, "heading":{},"elevation":{}，“distance”:{},...]表示在此时的位置所获得的信息
+        dis_loss_l = 0.        # obs=[ob1, ob2, ...obn]
 
         # Language input
         sentence, language_attention_mask, token_type_ids, \
-            seq_lengths, perm_idx = self._sort_batch(obs)
-        perm_obs = obs[perm_idx]
+            seq_lengths, perm_idx = self._sort_batch(obs)   # 根据sentence的长度由长到短进行排序, eg: sentence2,sentence1,sentence0
+        perm_obs = obs[perm_idx] # 对obs根据sentence长度进行排序,eg:perm_obs=[ob2,ob1,ob0]
 
         ''' Language Embedding '''
         language_inputs = {'mode':        'language',
                         'sentence':       sentence,
-                        'attention_mask': language_attention_mask,
-                        'lang_mask':      language_attention_mask,
+                        'attention_mask': language_attention_mask, #对句子的attention做mask处理，需要mask掉哪些词,eg:language_attention_mask=[0,1,...,0],1表示被mask掉
+                        'lang_mask':      language_attention_mask, #对句子本身做mask处理，并且要做padding处理，把句子长度都补成80
                         'token_type_ids': token_type_ids}
 
         # sentence embedding
-        if args.vlnbert == 'prevalent':
-            text_embeds = self.vln_bert(**language_inputs)
+        if args.vlnbert == 'prevalent': #recurrent VLN Bert模型的一种模式
+            text_embeds = self.vln_bert(**language_inputs) # 只针对语言进行embedding
 
-        language_attention_mask_drop = torch.rand_like(language_attention_mask.float()) < att_drop_rate
+        language_attention_mask_drop = torch.rand_like(language_attention_mask.float()) < att_drop_rate #对句子的attention做mask处理，若language_attention_mask对应产生的随机数< att_drop_rate就mask掉.
         language_attention_mask_drop = language_attention_mask_drop.long()
-        language_attention_mask_drop = language_attention_mask_drop.mul(language_attention_mask)
+        language_attention_mask_drop = language_attention_mask_drop.mul(language_attention_mask) #mul()表示乘法，最终的language_attention_mask_drop综合考虑了padding和attention
         language_inputs_drop = {'mode':        'language',
                         'sentence':       sentence,
                         'attention_mask': language_attention_mask_drop,
@@ -280,9 +280,9 @@ class Seq2SeqAgent(BaseAgent):
         if args.vlnbert == 'prevalent':
             text_embeds_drop = self.vln_bert(**language_inputs_drop)
 
-        log_probs1 = F.log_softmax(text_embeds_drop.clone(), 1)
+        log_probs1 = F.log_softmax(text_embeds_drop.clone(), 1) #dis_loss_1对应论文第(5)式
         probs2 = F.softmax(text_embeds.clone().detach(), 1)
-        dis_loss_l += self.disloss(log_probs1, probs2)
+        dis_loss_l += self.disloss(log_probs1, probs2) # disloss用来求KL散度
 
         log_probs2 = F.log_softmax(text_embeds.clone(), 1)
         probs1 = F.softmax(text_embeds_drop.clone().detach(), 1)
@@ -296,15 +296,16 @@ class Seq2SeqAgent(BaseAgent):
         } for ob in perm_obs]
 
         # Init the reward shaping
-        last_dist = np.zeros(batch_size, np.float32)
-        last_ndtw = np.zeros(batch_size, np.float32)
+        last_dist = np.zeros(batch_size, np.float32) # 表示当前agent距离最终目的地的距离，越近奖励越大
+        last_ndtw = np.zeros(batch_size, np.float32) # 表示当前路径与ground truth路径的相似度，相似度越大，则奖励越大
         for i, ob in enumerate(perm_obs):   # The init distance from the view point to the target
             last_dist[i] = ob['distance']
-            path_act = [vp[0] for vp in traj[i]['path']]
-            last_ndtw[i] = self.ndtw_criterion[ob['scan']](path_act, ob['gt_path'], metric='ndtw')
+            path_act = [vp[0] for vp in traj[i]['path']] # 把viewpointId单独提取出来
+            last_ndtw[i] = self.ndtw_criterion[ob['scan']](path_act, ob['gt_path'], metric='ndtw')#计算相似性
 
         # Initialization the tracking state
         ended = np.array([False] * batch_size)  # Indices match permuation of the model, not env
+                                                # 终止时ended变成true，有两种情况会发生终止：1.达到最大探索次数(episode_len)2.预测的action为stop
 
         # Init the logs
         rewards = []
@@ -314,15 +315,15 @@ class Seq2SeqAgent(BaseAgent):
         entropys = []
         ml_loss = 0.
         vis_taj = np.zeros((len(obs), self.episode_len, 2176), np.float32)
-        vis_taj = torch.from_numpy(vis_taj).cuda() 
+        vis_taj = torch.from_numpy(vis_taj).cuda() # 可以类比论文中的memory bank,表示视觉上的历史轨迹
 
-        for t in range(self.episode_len):
+        for t in range(self.episode_len): #episode_len表示最大探索次数
 
-            input_a_t, candidate_feat, candidate_leng = self.get_input_feat(perm_obs,t,vis_taj)
+            input_a_t, candidate_feat, candidate_leng = self.get_input_feat(perm_obs,t,vis_taj) #input_a_t表示输入的action，candidate_feat 可以理解为未经过MLP的m_t包含了
             candidate_feat_for_traj = candidate_feat.clone()
 
-            visual_temp_mask = (utils.length2mask(candidate_leng) == 0).long()
-            visual_attention_mask = torch.cat((language_attention_mask, visual_temp_mask), dim=-1)
+            visual_temp_mask = (utils.length2mask(candidate_leng) == 0).long() #对视觉图像进行mask处理
+            visual_attention_mask = torch.cat((language_attention_mask, visual_temp_mask), dim=-1)#对视觉图像的attention进行mask处理
                 
             ''' Visual BERT '''
             visual_inputs = {'mode':              'visual',
@@ -391,7 +392,7 @@ class Seq2SeqAgent(BaseAgent):
             obs = np.array(self.env._get_obs())
             perm_obs = obs[perm_idx]            # Perm the obs for the resu
 
-            if train_rl:
+            if train_rl: # RL的部分，可以不用管，要用的时候直接copy
                 # Calculate the mask and reward
                 dist = np.zeros(batch_size, np.float32)
                 ndtw_score = np.zeros(batch_size, np.float32)
@@ -439,7 +440,7 @@ class Seq2SeqAgent(BaseAgent):
             if ended.all():
                 break
 
-        if train_rl:
+        if train_rl: # 一个强化学习的代码，不用管
             # Last action in A2C
             input_a_t, candidate_feat, candidate_leng = self.get_input_feat(perm_obs, t+1, vis_taj)
 
@@ -447,7 +448,7 @@ class Seq2SeqAgent(BaseAgent):
             visual_attention_mask = torch.cat((language_attention_mask, visual_temp_mask), dim=-1)
 
             ''' Visual BERT '''
-            visual_inputs = {'mode':              'visual',
+            visual_inputs = {'mode':              'visual', # 此模式会综合考虑vision encoder 和 cross modal encoder
                             'sentence':           language_features,
                             'attention_mask':     visual_attention_mask,
                             'lang_mask':          language_attention_mask,
@@ -455,7 +456,7 @@ class Seq2SeqAgent(BaseAgent):
                             'token_type_ids':     token_type_ids,
                             'action_feats':       input_a_t,
                             # 'pano_feats':         f_t,
-                            'cand_feats':         candidate_feat,
+                            'cand_feats':         candidate_feat,#可以理解为未经过MLP的m_t包含了action_feats(即论文中的direction_feats) + vision_feats
                             't':                  t+1,
                             'seq_lengths':        seq_lengths,
                             'att_drop_rate':      att_drop_rate}
@@ -500,7 +501,7 @@ class Seq2SeqAgent(BaseAgent):
 
             self.loss += rl_loss
             self.logs['RL_loss'].append(rl_loss.item())
-
+        # 计算loss 对应论文中的(6)式
         if train_ml is not None:
             self.loss += ml_loss * train_ml / batch_size
             self.logs['IL_loss'].append((ml_loss * train_ml / batch_size).item())
